@@ -467,7 +467,9 @@ compilation and evaluation time conflicts."
 
 ;;; Fix for strings on version 27.1
 
-(when (version= emacs-version "27.1")
+(when (and
+       (version<= "27.1" emacs-version)
+       (version<= emacs-version "27.2"))
   ;; See:
   ;; https://github.com/emacs-csharp/csharp-mode/issues/175
   ;; https://github.com/emacs-csharp/csharp-mode/issues/151
@@ -523,7 +525,145 @@ compilation and evaluation time conflicts."
          ((bobp))
          ((eq pos-lt 'string)
           (c-put-syn-tab (1- (point)) '(15)))
-         (t nil))))))
+         (t nil)))))
+
+  (defun c-before-change-check-unbalanced-strings (beg end)
+    ;; If BEG or END is inside an unbalanced string, remove the syntax-table
+    ;; text property from respectively the start or end of the string.  Also
+    ;; extend the region (c-new-BEG c-new-END) as necessary to cope with the
+    ;; coming change involving the insertion or deletion of an odd number of
+    ;; quotes.
+    ;;
+    ;; POINT is undefined both at entry to and exit from this function, the
+    ;; buffer will have been widened, and match data will have been saved.
+    ;;
+    ;; This function is called exclusively as a before-change function via
+    ;; `c-get-state-before-change-functions'.
+    (c-save-buffer-state
+        ((end-limits
+          (progn
+            (goto-char (if (c-multiline-string-start-is-being-detached end)
+                           (1+ end)
+                         end))
+            (c-literal-limits)))
+         (end-literal-type (and end-limits
+                                (c-literal-type end-limits)))
+         (beg-limits
+          (progn
+            (goto-char beg)
+            (c-literal-limits)))
+         (beg-literal-type (and beg-limits
+                                (c-literal-type beg-limits))))
+
+      ;; It is possible the buffer change will include inserting a string quote.
+      ;; This could have the effect of flipping the meaning of any following
+      ;; quotes up until the next unescaped EOL.  Also guard against the change
+      ;; being the insertion of \ before an EOL, escaping it.
+      (cond
+       ((c-characterp c-multiline-string-start-char)
+        ;; The text about to be inserted might contain a multiline string
+        ;; opener.  Set c-new-END after anything which might be affected.
+        ;; Go to the end of the putative multiline string.
+        (goto-char end)
+        (c-pps-to-string-delim (point-max))
+        (when (< (point) (point-max))
+          (while
+              (and
+               (progn
+                 (while
+                     (and
+                      (c-syntactic-re-search-forward
+                       (if c-single-quotes-quote-strings
+                           "[\"']\\|\\s|"
+                         "\"\\|\\s|")
+                       (point-max) t t)
+                      (progn
+                        (c-clear-syn-tab (1- (point)))
+                        (not (memq (char-before) c-string-delims)))))
+                 (memq (char-before) c-string-delims))
+               (if (eq (char-before (1- (point)))
+                       c-multiline-string-start-char)
+                   (progn
+                     (c-pps-to-string-delim (point-max))
+                     (< (point) (point-max)))
+                 (c-pps-to-string-delim (c-point 'eoll))
+                 (< (point) (c-point 'eoll))))))
+        (setq c-new-END (max (point) c-new-END)))
+
+       (c-multiline-string-start-char
+        (setq c-bc-changed-stringiness
+              (not (eq (eq end-literal-type 'string)
+                       (eq beg-literal-type 'string))))
+        ;; Deal with deletion of backslashes before "s.
+        (goto-char end)
+        (if (and (looking-at (if c-single-quotes-quote-strings
+                                 "\\\\*[\"']"
+                               "\\\\*\""))
+                 (c-is-escaped (point)))
+            (setq c-bc-changed-stringiness (not c-bc-changed-stringiness)))
+        (if (eq beg-literal-type 'string)
+            (setq c-new-BEG (min (car beg-limits) c-new-BEG))))
+
+       ((< end (point-max))
+        ;; Have we just escaped a newline by deleting characters?
+        (if (and (eq end-literal-type 'string)
+                 (memq (char-after end) '(?\n ?\r)))
+            (cond
+             ;; Are we escaping a newline by deleting stuff between \ and \n?
+             ((and (> end beg)
+                   (c-will-be-escaped end beg end))
+              (c-remove-string-fences end)
+              (goto-char (1+ end)))
+             ;; Are we unescaping a newline by inserting stuff between \ and \n?
+             ((and (eq end beg)
+                   (c-is-escaped end))
+              (goto-char (1+ end))) ; To after the NL which is being unescaped.
+             (t
+              (goto-char end)))
+          (goto-char end))
+
+        ;; Move to end of logical line (as it will be after the change, or as it
+        ;; was before unescaping a NL.)
+        (re-search-forward "\\(\\\\\\(.\\|\n\\)\\|[^\\\n\r]\\)*" nil t)
+        ;; We're at an EOLL or point-max.
+        (if (equal (c-get-char-property (point) 'syntax-table) '(15))
+            (if (memq (char-after) '(?\n ?\r))
+                ;; Normally terminated invalid string.
+                (c-remove-string-fences)
+              ;; Opening " at EOB.
+              (c-clear-syn-tab (1- (point))))
+          (when (and (c-search-backward-char-property 'syntax-table '(15) c-new-BEG)
+                     (memq (char-after) c-string-delims)) ; Ignore an unterminated raw string's (.
+            ;; Opening " on last line of text (without EOL).
+            (c-remove-string-fences)
+            (setq c-new-BEG (min c-new-BEG (point))))))
+
+       (t (goto-char end)			; point-max
+          (when
+              (and
+               (c-search-backward-char-property 'syntax-table '(15) c-new-BEG)
+               (memq (char-after) c-string-delims))
+            (c-remove-string-fences))))
+
+      (unless
+          (or (and
+               ;; Don't set c-new-BEG/END if we're in a raw string.
+               (eq beg-literal-type 'string)
+               (c-at-c++-raw-string-opener (car beg-limits)))
+              (and c-multiline-string-start-char
+                   (not (c-characterp c-multiline-string-start-char))))
+        (when (and (eq end-literal-type 'string)
+                   (not (eq (char-before (cdr end-limits)) ?\())
+                   (memq (char-after (car end-limits)) c-string-delims)
+                   (equal (c-get-char-property (car end-limits) 'syntax-table)
+                          '(15)))
+          (c-remove-string-fences (car end-limits))
+          (setq c-new-END (max c-new-END (cdr end-limits))))
+
+        (when (and (eq beg-literal-type 'string)
+                   (memq (char-after (car beg-limits)) c-string-delims))
+          (c-remove-string-fences (car beg-limits))
+          (setq c-new-BEG (min c-new-BEG (car beg-limits))))))))
 
 ;;; End of fix for strings on version 27.1
 
